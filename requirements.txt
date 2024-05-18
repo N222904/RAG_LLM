@@ -1,2 +1,5 @@
 openai==1.0.0
 streamlit-option-menu==0.3.12
+langchain==0.1.20
+langchain-community==0.0.38
+langchain-experimental==0.0.58
