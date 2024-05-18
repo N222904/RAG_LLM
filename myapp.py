@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_experimental.sql import SQLDatabaseChain
+import MySQLdb
 
 # --------------------------------------------------------------------------
 # Inicialização da instância do cliente OpenAI com chave de API e acessos BD
