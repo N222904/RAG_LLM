@@ -1,26 +1,34 @@
-# Importando as bibliotecas necessárias
-import openai
 import streamlit as st
 from streamlit_option_menu import option_menu
-import pandas as pd
-import time
-import shelve
-import openai
-from langchain import*
-import sqlite3
-import sqlalchemy
-import pandas as pd
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
-from langchain_experimental.sql import SQLDatabaseChain
-import MySQLdb
 
-# --------------------------------------------------------------------------
-# Inicialização da instância do cliente OpenAI com chave de API e acessos BD
-# --------------------------------------------------------------------------
-client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+from langchain_community.utilities import SQLDatabase
+from langchain_community.chat_message_histories import (
+   StreamlitChatMessageHistory
+)
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_openai import OpenAI
+from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
+from langchain.chains.sql_database.query import create_sql_query_chain
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from operator import itemgetter
+from langchain_community.agent_toolkits import create_sql_agent
+from langchain_google_genai import ChatGoogleGenerativeAI
+import getpass
+import os
 
+from database import delete_in_database, update_in_database, get_history
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import asyncio
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+# Definindo conexao com banco
 username = st.secrets["username"]
 password = st.secrets["password"]
 host = st.secrets["host"]
@@ -29,55 +37,146 @@ database = st.secrets["database"]
 
 mysql_url = f'mysql+mysqldb://{username}:{password}@{host}:{port}/{database}'
 
-# Configurando com langchain
-input_db = SQLDatabase.from_uri(mysql_url)
-llm_1 = OpenAI(temperature=1)
-db_agent = SQLDatabaseChain(llm = llm_1, database =input_db, verbose=True)
+#llm = OpenAI(model="gpt-4")
 
-# -----------------------------------------------------------------
-# Funções para geração de resposta
-# -----------------------------------------------------------------
-def generate_response(message_body, db_agent=db_agent):
-    response = db_agent.run(message_body)
-    return response
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest")
 
-# -----------------------------------------------------------------
-# Inicializando estado da sessão:
-# -----------------------------------------------------------------
 
-# Initialization
-if 'in_chat' not in st.session_state:
-    st.session_state['in_chat'] = None
+if "chat_list" not in st.session_state:
+    st.session_state.chat_list = []
+    
+if "messages_list" not in st.session_state:
+    st.session_state.messages_list = []
 
-# Inicializa a lista de mensagens
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if "disabled" not in st.session_state:
+    st.session_state.disabled = True
 
-# Título da interface de Streamlit
-st.title("GPT Analítico")
+if "chat_key" not in st.session_state:
+    st.session_state.chat_key = "Chat 1"
+    
 
-# Aqui, ele itera sobre todas as mensagens e as exibe (ORIGINAL)
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
 
-# Criação de campo de entrada para a mensagem do usuário
-if prompt := st.chat_input("Escreva aqui:"):
-    #for i in range(len(st.session_state.messages)):
-    #    aux = st.session_state.messages[i]["role"]
-    #    with st.chat_message(aux):
-    #        st.markdown(st.session_state.messages[i]["content"])
+def format_messages_list(messages_list: list):
+    messages = []    
+    for message in messages_list:
+        match message["role"]:
+            case "user":
+                messages.append(HumanMessage(content=message["message"]))
+            case "model":
+                messages.append(AIMessage(content=message["message"]))
+                
+    msgs = StreamlitChatMessageHistory(key=st.session_state.chat_list[-1])        
+    msgs.add_messages(messages)
 
-    # A mensagem do usuário é adicionada à lista de mensagens
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
 
-    # Aqui, passa a resposta do usuário para o assistente OpenAI e gera a resposta do assistente
-    with st.chat_message("assistant"):
-        response = generate_response(prompt)
-        #response = st.write_stream(stream)
-        st.write(response)
+if not st.session_state.chat_list:
+    history = get_history()
+
+    for chats in history:
+        st.session_state.chat_list.append(chats.chat_name)
         
-    # A resposta do assistente é adicionada à lista de mensagens
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        chat_messages = chats.chat_messages["messages"]
+
+        format_messages_list(chat_messages)
+
+
+
+def get_chat_name():
+    chat_name = st.session_state["text"]
+    st.session_state.chat_list.append(chat_name)
+    st.session_state["text"] = ""
+
+
+def get_chat_selection(key):
+    st.session_state.chat_key = st.session_state[key]
+
+
+def list_messages():
+    messages_list = []
+    for msg in msgs.messages:
+        match msg.type:
+            case "human":
+                messages_list.append({
+                    "role": "user",
+                    "message": msg.content
+                })
+            case "ai":
+                messages_list.append({
+                    "role": "model",
+                    "message": msg.content
+                })
+    return messages_list
+
+
+msgs = StreamlitChatMessageHistory(key=st.session_state.chat_key)
+
+
+with st.sidebar:
+    col1, col2 = st.columns(2)
+    with col1:
+        if add_button := st.button("Criar novo chat"):
+            st.session_state.disabled = False
+        else:
+            st.session_state.disabled = True
+            
+    with col2:
+        if delete_button := st.button("Deletar chat"):
+            msgs.clear()
+            chat_name = st.session_state.chat_key           
+            st.session_state.chat_list.remove(chat_name) 
+            delete_in_database(chat_name)
+            
+            
+
+    text_input = st.text_input(label="Nome do novo chat",
+                               key="text",
+                               disabled=st.session_state.disabled,
+                               on_change=get_chat_name,
+                               args=None)
+    
+    
+    if st.session_state.chat_list:
+        selected = option_menu("Histórico", st.session_state.chat_list,
+                               on_change=get_chat_selection, key="chats", 
+                               styles={"container": {"background-color": "rgb(38, 39, 48)"},
+                                       "nav-item": {"padding": "5px 0 5px"},         
+                                       "icon": {"visibility": "hidden", "font-size": "0px"},
+                                       })
+
+
+db = SQLDatabase.from_uri(mysql_url)
+
+instrucoes = ("system"), """
+Voce é um chat bot analítico com 2 perfis. Primeiro, assistente analítico de vendas, 
+          segundo especialista veterinário. Acesse o banco de dados e responda de acordo.
+          Fale somente em portugues
+         Contexto={contexto}
+"""
+prompt = ChatPromptTemplate.from_messages(
+    [
+        instrucoes,
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{question}")
+    ]
+)
+
+chain = prompt | llm
+agent_executor = create_sql_agent(llm, db=db, agent_type="tool-calling")
+
+chain_with_history = RunnableWithMessageHistory(chain, lambda session_id: msgs,
+                                                input_messages_key="question",
+                                                history_messages_key="history",)
+
+for msg in msgs.messages:
+    st.chat_message(msg.type).write(msg.content)
+
+if prompt := st.chat_input():
+    st.chat_message("human").markdown(prompt)
+    
+    config = {"configurable": {"session_id": "any"}}
+
+    response_sql = agent_executor.invoke(prompt)
+    response = chain_with_history.invoke({"contexto": response_sql['output'],"question": prompt}, config)
+    st.chat_message("ai").markdown(response.content)
+    
+    update_in_database(st.session_state.chat_key, {"messages": list_messages()})
